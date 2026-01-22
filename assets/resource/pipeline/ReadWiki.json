@@ -14,7 +14,8 @@
         "next": [
             "ClickWikiHomePageUnreadBadge",
             "ClickChapterUnreadBadge",
-            "WikiBackButton"
+            "WikiBackButton",
+            "WikiExitButton"
         ]
     },
     "WikiBackButton": {
@@ -35,8 +36,24 @@
         },
         "next": [
             "ClickWikiHomePageUnreadBadge",
-            "ClickChapterUnreadBadge"
+            "ClickChapterUnreadBadge",
+            "WikiExitButton"
         ]
+    },
+    "WikiExitButton": {
+        "recognition": {
+            "type": "TemplateMatch",
+            "param": {
+                "template": "ReadWiki/WikiExitButton.png",
+                "roi": [
+                    1164,
+                    0,
+                    116,
+                    99
+                ]
+            }
+        }
+        // 任务结束
     },
     "ClickWikiHomePageUnreadBadge": {
         "recognition": {
@@ -68,7 +85,7 @@
                 "roi": [
                     21,
                     51,
-                    317,
+                    350,
                     58
                 ]
             }
