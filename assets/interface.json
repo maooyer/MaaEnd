@@ -13,8 +13,7 @@
     "controller": [
         {
             "name": "安卓端",
-            "type": "Adb",
-            "display_short_side": 1080
+            "type": "Adb"
         },
         {
             "name": "桌面端",
@@ -25,8 +24,7 @@
                 "screencap": "FramePool",
                 "mouse": "PostMessageWithCursorPos",
                 "keyboard": "PostMessageWithCursorPos"
-            },
-            "display_short_side": 1080
+            }
         }
     ],
     "resource": [
