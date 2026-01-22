@@ -64,8 +64,44 @@ jobs:
       is_release: ${{ steps.set_tag.outputs.is_release }}
       is_prerelease: ${{ steps.set_tag.outputs.is_prerelease }}
 
+  prepare_mxu_icon:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download MXU
+        uses: robinraju/release-downloader@v1
+        with:
+          repository: MistEO/MXU
+          fileName: "*win-x86_64*"
+          latest: true
+          out-file-path: "downloads/MXU"
+          extract: true
+
+      - name: Convert PNG to ICO
+        shell: bash
+        run: |
+          choco install imagemagick -y
+          # 为每个尺寸单独生成图像，确保 ICO 中包含独立的各尺寸图层
+          for size in 512 256 128 64 48 32 24 16; do
+            magick assets/misc/MaaEnd-Tiny.png -resize ${size}x${size} icon-${size}.png
+          done
+          magick icon-512.png icon-256.png icon-128.png icon-64.png icon-48.png icon-32.png icon-24.png icon-16.png maaend.ico
+
+      - name: Modify MXU exe icon
+        shell: bash
+        run: |
+          curl -L https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe -o rcedit.exe
+          ./rcedit.exe "downloads/MXU/mxu.exe" --set-icon "maaend.ico"
+          echo "MXU icon modified successfully"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mxu-win-x86_64-with-icon
+          path: "downloads/MXU/mxu.exe"
+
   build_and_install:
-    needs: meta
+    needs: [meta, prepare_mxu_icon]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -91,7 +127,7 @@ jobs:
           extract: true
 
       - name: Download MXU
-        if: ${{ !(matrix.os == 'linux' && matrix.arch == 'aarch64') }}
+        if: ${{ !(matrix.os == 'linux' && matrix.arch == 'aarch64') && !(matrix.os == 'win' && matrix.arch == 'x86_64') }}
         uses: robinraju/release-downloader@v1
         with:
           repository: MistEO/MXU
@@ -99,6 +135,13 @@ jobs:
           latest: true
           out-file-path: "downloads/MXU"
           extract: true
+
+      - name: Download MXU with icon (Windows x64)
+        if: matrix.os == 'win' && matrix.arch == 'x86_64'
+        uses: actions/download-artifact@v4
+        with:
+          name: mxu-win-x86_64-with-icon
+          path: "downloads/MXU"
 
       - name: Install
         shell: bash
@@ -159,11 +202,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: MaaEnd-*
           path: assets
 
       - run: |
           cd assets
-          for f in *; do
+          for f in MaaEnd-*; do
             (cd $f && zip -r ../$f-${{ needs.meta.outputs.tag }}.zip .)
           done
 
