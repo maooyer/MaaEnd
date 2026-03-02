@@ -740,8 +740,25 @@ def install_mxu(
             return False, local_version, False
 
 
+def _is_cn_locale() -> bool:
+    """检测当前系统语言是否为简体中文"""
+    import locale as _locale
+
+    loc = _locale.getlocale()
+    lang = (loc[0] or "").lower()
+    return lang in ("zh_cn", "chinese (simplified)_china")
+
+
 def main() -> None:
     init_local()
+
+    if _is_cn_locale():
+        print(
+            Console.warn(
+                "[提示] 本脚本需要访问 GitHub，若出现下载超时或连接失败，可尝试配置系统代理"
+            )
+        )
+        print("-" * 60)
 
     parser = argparse.ArgumentParser(description=t("description"))
     parser.add_argument("--update", action="store_true", help=t("arg_update"))
