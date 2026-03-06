@@ -34,10 +34,6 @@ type MapTrackerMoveParam struct {
 	RotationLowerThreshold float64 `json:"rotation_lower_threshold,omitempty"`
 	// RotationUpperThreshold is the angular difference in degrees above which a more aggressive correction is applied.
 	RotationUpperThreshold float64 `json:"rotation_upper_threshold,omitempty"`
-	// RotationSpeed is the multiplier applied to the delta rotation when rotating the camera.
-	RotationSpeed float64 `json:"rotation_speed,omitempty"`
-	// RotationTimeout is the maximum time in milliseconds allowed for rotation adjustment.
-	RotationTimeout int64 `json:"rotation_timeout,omitempty"`
 	// SprintThreshold is the minimum distance beyond which sprinting is used.
 	SprintThreshold float64 `json:"sprint_threshold,omitempty"`
 	// StuckThreshold is the duration in milliseconds after which lack of movement is considered a stuck condition.
@@ -46,12 +42,16 @@ type MapTrackerMoveParam struct {
 	StuckTimeout int64 `json:"stuck_timeout,omitempty"`
 }
 
-type PlayerMovementType byte
+// PlayerMovement represents different movement state in the game
+type PlayerMovement struct {
+	Speed         float64 // Movement speed (px/s)
+	RotationSpeed float64 // Rotation adjustment response speed (degrees/s)
+}
 
-const (
-	MOVEMENT_WALK   PlayerMovementType = 1
-	MOVEMENT_RUN    PlayerMovementType = 2
-	MOVEMENT_SPRINT PlayerMovementType = 3
+var (
+	MovementWalk   = PlayerMovement{2.0, 180.0}
+	MovementRun    = PlayerMovement{8.0, 360.0}
+	MovementSprint = PlayerMovement{12.0, 1800.0}
 )
 
 //go:embed messages/emergency_stop.html
@@ -105,7 +105,16 @@ func (a *MapTrackerMove) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
 	aw.KeyTypeSync(KEY_SHIFT, 50)
 	aw.KeyUpSync(KEY_S, 50)
 	aw.KeyTypeSync(KEY_W, 50)
-	movementType := MOVEMENT_RUN
+	movement := &MovementRun
+
+	// Adaptive rotation sensitivity local state
+	rotationSpeed := ROTATION_DEFAULT_SPEED
+	var (
+		lastAdjustTime    time.Time
+		lastAdjustPos     *[2]int
+		lastAdjustRot     *int
+		lastAdjustApplied float64
+	)
 
 	// For each target point
 	for i, target := range param.Path {
@@ -126,11 +135,10 @@ func (a *MapTrackerMove) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
 		}
 
 		var (
-			lastInferTime          = time.Time{}
-			lastRotationAdjustTime = time.Time{}
-			lastArrivalTime        = time.Now()
-			prevLocationTime       = time.Time{}
-			prevLocation           *[2]int
+			lastInferTime    = time.Time{}
+			lastArrivalTime  = time.Now()
+			prevLocationTime = time.Time{}
+			prevLocation     *[2]int
 		)
 
 		for {
@@ -166,7 +174,32 @@ func (a *MapTrackerMove) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
 			}
 			curX, curY := result.X, result.Y
 			rot := result.Rot
-
+			// Update adaptive rotation sensitivity
+			if lastAdjustRot != nil && lastAdjustPos != nil {
+				timeElapsed := time.Since(lastAdjustTime)
+				distTravel := math.Hypot(float64(curX-lastAdjustPos[0]), float64(curY-lastAdjustPos[1]))
+				lastAdjustRotUpperAbsBound := movement.RotationSpeed * timeElapsed.Seconds()
+				if timeElapsed > 0 {
+					speed := distTravel / timeElapsed.Seconds()
+					// Check if player is moving sufficiently to trust rotation measurement
+					if speed > MovementWalk.Speed && lastAdjustApplied > param.RotationLowerThreshold {
+						lastAdjustAppliedFixed := max(-lastAdjustRotUpperAbsBound, min(lastAdjustRotUpperAbsBound, lastAdjustApplied))
+						actualRotDelta := calcDeltaRotation(*lastAdjustRot, rot)
+						idealSpeed := lastAdjustAppliedFixed / (float64(actualRotDelta) + 1e-6)
+						if idealSpeed >= ROTATION_MIN_SPEED && idealSpeed <= ROTATION_MAX_SPEED {
+							rotationSpeed = rotationSpeed*0.618 + idealSpeed*0.382
+							log.Debug().
+								Float64("idealSpeed", idealSpeed).
+								Float64("newSpeed", rotationSpeed).
+								Int("actualRotDelta", actualRotDelta).
+								Float64("lastAdjustApplied", lastAdjustApplied).
+								Float64("lastAdjustAppliedFixed", lastAdjustAppliedFixed).
+								Msg("Adaptive rotation speed updated")
+						}
+					}
+				}
+				lastAdjustRot = nil // Clear state
+			}
 			// Calculate rotation difference
 			targetRot := calcTargetRotation(curX, curY, targetX, targetY)
 			deltaRot := calcDeltaRotation(rot, targetRot)
@@ -188,7 +221,7 @@ func (a *MapTrackerMove) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
 				break
 			}
 
-			log.Debug().Int("x", curX).Int("y", curY).Float64("dist", dist).Msg("Navigating to target")
+			log.Debug().Int("curX", curX).Int("curY", curY).Int("curRot", rot).Float64("dist", dist).Int("targetRot", targetRot).Msg("Navigating to target")
 
 			// Check Stuck
 			if prevLocation != nil && prevLocation[0] == curX && prevLocation[1] == curY {
@@ -207,61 +240,59 @@ func (a *MapTrackerMove) Run(ctx *maa.Context, arg *maa.CustomActionArg) bool {
 				prevLocationTime = now
 			}
 
-			// Check rotation and adjust if needed
+			// Check if rotation is not good enough to sprint
 			if math.Abs(float64(deltaRot)) > param.RotationLowerThreshold {
-				if lastRotationAdjustTime.IsZero() {
-					lastRotationAdjustTime = now
-				}
-				deltaRotationAdjustMs := now.Sub(lastRotationAdjustTime).Milliseconds()
-				if deltaRotationAdjustMs > param.RotationTimeout {
-					log.Error().Msg("Rotation adjustment timeout, stopping task")
-					doEmergencyStop(aw, param.NoPrint)
-					return false
-				}
-
-				log.Debug().Int("cur", rot).Int("target", targetRot).Int("delta", deltaRot).Msg("Adjusting rotation")
-
 				// Ensure no sprinting: forcibly set to 'walk'
-				if movementType > MOVEMENT_RUN {
+				if movement.Speed > MovementRun.Speed {
 					aw.KeyTypeSync(KEY_CTRL, 25)
-					movementType = MOVEMENT_WALK
+					movement = &MovementWalk
 				}
-
-				// Ensure a proper movement type: 'walk' if needs large rotation adjustment, otherwise 'run'
-				if math.Abs(float64(deltaRot)) > param.RotationUpperThreshold {
-					if movementType > MOVEMENT_WALK {
-						aw.KeyTypeSync(KEY_CTRL, 25)
-						movementType = MOVEMENT_WALK
-					}
-					aw.RotateCamera(int(float64(deltaRot)*param.RotationSpeed), 50, 25)
-					aw.KeyDownSync(KEY_W, 50)
-				} else {
-					if movementType < MOVEMENT_RUN {
-						aw.KeyTypeSync(KEY_CTRL, 25)
-						movementType = MOVEMENT_RUN
-					}
-					aw.KeyDownSync(KEY_W, 25)
-					aw.RotateCamera(int(float64(deltaRot)*param.RotationSpeed), 50, 25)
-				}
-
-				// Do rotation adjustment
-				aw.ResetCamera(50)
 			} else {
 				// Rotation is good: at least set to 'run'
-				if movementType < MOVEMENT_RUN {
+				if movement.Speed < MovementRun.Speed {
 					aw.KeyTypeSync(KEY_CTRL, 25)
-					movementType = MOVEMENT_RUN
+					movement = &MovementRun
 				}
 				aw.KeyDownSync(KEY_W, 25)
 
 				if dist > param.SprintThreshold {
 					// Target is far enough: enable 'sprint'
-					if movementType < MOVEMENT_SPRINT {
+					if movement.Speed < MovementSprint.Speed {
 						aw.KeyTypeSync(KEY_SHIFT, 100)
-						movementType = MOVEMENT_SPRINT
+						movement = &MovementSprint
 					}
 				}
-				lastRotationAdjustTime = time.Time{} // Reset
+			}
+
+			// Adjust rotation
+			if math.Abs(float64(deltaRot)) > 1.0 {
+				// Update for adaptive mechanism
+				appliedDelta := calcAppliedDeltaRotation(deltaRot)
+				rotCopy := rot
+				lastAdjustRot = &rotCopy
+				lastAdjustPos = &[2]int{curX, curY}
+				lastAdjustTime = time.Now()
+				lastAdjustApplied = appliedDelta
+
+				// Select appropriate rotation method based on how bad the rotation is
+				if math.Abs(float64(deltaRot)) > param.RotationUpperThreshold {
+					// Rotation is very bad: forcibly set to 'walk' for better control
+					if movement.Speed > MovementWalk.Speed {
+						aw.KeyTypeSync(KEY_CTRL, 25)
+						movement = &MovementWalk
+					}
+					aw.RotateCamera(int(appliedDelta*rotationSpeed), 50, 25)
+					aw.KeyDownSync(KEY_W, 50)
+				} else {
+					// Rotation is acceptable but can be improved: at least ensure 'run'
+					if movement.Speed < MovementRun.Speed {
+						aw.KeyTypeSync(KEY_CTRL, 25)
+						movement = &MovementRun
+					}
+					aw.KeyDownSync(KEY_W, 25)
+					aw.RotateCamera(int(appliedDelta*rotationSpeed), 50, 25)
+				}
+				aw.ResetCamera(50)
 			}
 		}
 		// End of loop, one target reached
@@ -323,18 +354,6 @@ func (a *MapTrackerMove) parseParam(paramStr string) (*MapTrackerMoveParam, erro
 		return nil, fmt.Errorf("rotation_upper_threshold must be between 0 and 180 degrees")
 	} else if param.RotationUpperThreshold == 0 {
 		param.RotationUpperThreshold = DEFAULT_MOVING_PARAM.RotationUpperThreshold
-	}
-
-	if param.RotationSpeed < 0 {
-		return nil, fmt.Errorf("rotation_speed must be non-negative")
-	} else if param.RotationSpeed == 0 {
-		param.RotationSpeed = DEFAULT_MOVING_PARAM.RotationSpeed
-	}
-
-	if param.RotationTimeout < 0 {
-		return nil, fmt.Errorf("rotation_timeout must be non-negative")
-	} else if param.RotationTimeout == 0 {
-		param.RotationTimeout = DEFAULT_MOVING_PARAM.RotationTimeout
 	}
 
 	if param.SprintThreshold < 0 {
@@ -453,4 +472,14 @@ func calcDeltaRotation(current, target int) int {
 		diff += 360
 	}
 	return diff
+}
+
+// calcAppliedDeltaRotation calculates the augmented rotation adjustment to apply
+func calcAppliedDeltaRotation(deltaRot int) float64 {
+	absRot := math.Abs(float64(deltaRot))
+	absRotAug := (ROTATION_ADJUSTMENT_LOWER_BOUND * ROTATION_ADJUSTMENT_LOWER_BOUND / (absRot + ROTATION_ADJUSTMENT_LOWER_BOUND)) + absRot
+	if deltaRot > 0 {
+		return absRotAug
+	}
+	return math.Round(-absRotAug)
 }
