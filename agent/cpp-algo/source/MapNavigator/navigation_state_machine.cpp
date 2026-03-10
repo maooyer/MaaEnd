@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -148,13 +147,6 @@ bool NavigationStateMachine::Run()
         }
     }
 
-    if (!should_stop_() && param_.is_exact_target && !session_->current_path().empty() && session_->phase() != NaviPhase::Failed) {
-        session_->UpdatePhase(NaviPhase::ExactTargetRefine, "exact_target_start");
-        const bool exact_target_completed = TickPhase(session_->phase()) && !should_stop_();
-        stop_motion_before_exit();
-        return exact_target_completed;
-    }
-
     if (!should_stop_() && session_->phase() != NaviPhase::Failed) {
         session_->UpdatePhase(NaviPhase::Finished, "navigation_complete");
     }
@@ -209,9 +201,6 @@ bool NavigationStateMachine::TickPhase(NaviPhase phase)
     case NaviPhase::RecoverRejoin:
         SelectPhaseForCurrentWaypoint("recover_rejoin_dispatch");
         return true;
-
-    case NaviPhase::ExactTargetRefine:
-        return TickExactTargetRefine();
 
     case NaviPhase::Finished:
     case NaviPhase::Failed:
@@ -488,6 +477,13 @@ bool NavigationStateMachine::TickAdvanceOnRoute()
     const double target_y = current_waypoint.y;
     const double distance = std::hypot(target_x - real_pos_x, target_y - real_pos_y);
     const double actual_distance = std::hypot(target_x - position_->x, target_y - position_->y);
+    if (actual_distance <= kStrictArrivalWalkResetDistance
+        && motion_controller_->CancelSprintIfActive(kWalkResetReleaseMs)) {
+        last_auto_sprint_time_ = {};
+        session_->ResetStraightStableFrames();
+        SleepFor(kWalkResetSettleMs);
+        return true;
+    }
     if (current_waypoint.RequiresStrictArrival() && strict_arrival_walk_reset_node_idx_ != session_->current_node_idx()
         && actual_distance <= kStrictArrivalWalkResetDistance && motion_controller_->IsMoving()) {
         motion_controller_->ResetForwardWalk(kWalkResetReleaseMs);
@@ -721,15 +717,12 @@ bool NavigationStateMachine::TickAdvanceOnRoute()
         motion_controller_->EnsureForwardMotion(false);
     }
 
-    const bool auto_sprint_ready = param_.sprint_threshold > 0.0 && actual_distance > param_.sprint_threshold
-                                   && std::abs(sensor_yaw_error) <= kLocalDriverSideAvoidYawDegrees && !held_fix
-                                   && !is_zone_transition_isolated && !post_turn_forward_commit_active
-                                   && !current_waypoint.RequiresStrictArrival() && motion_controller_->IsMoving()
-                                   && (!param_.enable_local_driver
-                                       || (driver_decision.state == LocalDriverState::Cruise
-                                           && driver_decision.action == LocalDriverAction::Forward && !driver_decision.commitment_active));
+    const double sprint_segment_distance = EstimateSprintSegmentDistance();
+    const bool auto_sprint_ready =
+        param_.sprint_threshold > 0.0 && sprint_segment_distance > param_.sprint_threshold && !held_fix
+        && !is_zone_transition_isolated && motion_controller_->IsMoving();
     if (auto_sprint_ready) {
-        MaybeTriggerAutoSprint(actual_distance, sensor_yaw_error, loop_now);
+        MaybeTriggerAutoSprint(sprint_segment_distance, actual_distance, sensor_yaw_error, loop_now);
     }
 
     session_->RecordDriverObservation(actual_distance, *position_);
@@ -742,7 +735,46 @@ bool NavigationStateMachine::TickAdvanceOnRoute()
     return true;
 }
 
+double NavigationStateMachine::EstimateSprintSegmentDistance() const
+{
+    if (!session_->HasCurrentWaypoint()) {
+        return 0.0;
+    }
+
+    const auto& path = session_->current_path();
+    const size_t current_idx = session_->current_node_idx();
+    if (current_idx >= path.size()) {
+        return 0.0;
+    }
+
+    const Waypoint& current_waypoint = path[current_idx];
+    if (!current_waypoint.HasPosition()) {
+        return 0.0;
+    }
+
+    const double current_leg_distance = std::hypot(current_waypoint.x - position_->x, current_waypoint.y - position_->y);
+    for (size_t index = current_idx + 1; index < path.size(); ++index) {
+        const Waypoint& next_waypoint = path[index];
+        if (!next_waypoint.HasPosition()) {
+            break;
+        }
+
+        if (!current_waypoint.zone_id.empty() && !next_waypoint.zone_id.empty() && next_waypoint.zone_id != current_waypoint.zone_id) {
+            break;
+        }
+
+        if (next_waypoint.RequiresStrictArrival() || next_waypoint.action != ActionType::RUN) {
+            break;
+        }
+
+        return current_leg_distance + std::hypot(next_waypoint.x - current_waypoint.x, next_waypoint.y - current_waypoint.y);
+    }
+
+    return current_leg_distance;
+}
+
 void NavigationStateMachine::MaybeTriggerAutoSprint(
+    double sprint_segment_distance,
     double actual_distance,
     double sensor_yaw_error,
     const std::chrono::steady_clock::time_point& now)
@@ -753,63 +785,12 @@ void NavigationStateMachine::MaybeTriggerAutoSprint(
     }
 
     action_wrapper_->TriggerSprintSync();
+    motion_controller_->NotifySprintTriggered();
     last_auto_sprint_time_ = now;
 
     const size_t current_node_idx = session_->current_node_idx();
-    LogInfo << "Auto sprint triggered." << VAR(current_node_idx) << VAR(actual_distance) << VAR(sensor_yaw_error);
-}
-
-bool NavigationStateMachine::TickExactTargetRefine()
-{
-    const auto exact_target_it =
-        std::find_if(session_->current_path().rbegin(), session_->current_path().rend(), [](const Waypoint& waypoint) {
-            return waypoint.HasPosition();
-        });
-    if (exact_target_it == session_->current_path().rend()) {
-        session_->UpdatePhase(NaviPhase::Finished, "no_exact_target_waypoint");
-        return true;
-    }
-
-    const double target_x = exact_target_it->x;
-    const double target_y = exact_target_it->y;
-    const std::string target_zone_id = exact_target_it->zone_id;
-    LogInfo << "Starting exact target approach...";
-    const auto exact_start_time = std::chrono::steady_clock::now();
-
-    while (!should_stop_()) {
-        if (!position_provider_->Capture(position_, false, target_zone_id)) {
-            SleepFor(kExactTargetLocatorRetryIntervalMs);
-            continue;
-        }
-
-        const double dist = std::hypot(target_x - position_->x, target_y - position_->y);
-        if (dist < kExactTargetDistanceThreshold) {
-            session_->UpdatePhase(NaviPhase::Finished, "exact_target_reached");
-            LogInfo << "Exact target reached!!!";
-            return true;
-        }
-
-        const auto elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - exact_start_time).count();
-        if (elapsed > kExactTargetTimeoutMs) {
-            session_->UpdatePhase(NaviPhase::Failed, "exact_target_timeout");
-            LogWarn << "Exact target approach timeout";
-            return true;
-        }
-
-        const double exact_rot = NaviMath::CalcTargetRotation(position_->x, position_->y, target_x, target_y);
-        const double delta_rot = NaviMath::CalcDeltaRotation(position_->angle, exact_rot);
-        if (std::abs(delta_rot) > kExactTargetRotationDeviationThreshold) {
-            motion_controller_->InjectMouseAndTrack(delta_rot, false, target_zone_id, kExactTargetRotationWaitMs);
-        }
-
-        action_wrapper_->KeyDownSync(kKeyW, 0);
-        SleepFor(kExactTargetMoveWaitMs);
-        action_wrapper_->KeyUpSync(kKeyW, 0);
-        SleepFor(kExactTargetStopWaitMs);
-    }
-
-    return false;
+    LogInfo << "Auto sprint triggered." << VAR(current_node_idx) << VAR(sprint_segment_distance) << VAR(actual_distance)
+            << VAR(sensor_yaw_error);
 }
 
 bool NavigationStateMachine::ConsumeHeadingNodes(bool sync_with_sensor_yaw)
@@ -850,7 +831,7 @@ bool NavigationStateMachine::ConsumeHeadingNodes(bool sync_with_sensor_yaw)
             motion_controller_->EnsureForwardMotion(true);
         }
         else {
-            action_wrapper_->ClickKeySync(kKeyW, kExactTargetMoveWaitMs);
+            action_wrapper_->ClickKeySync(kKeyW, kPostHeadingForwardPulseMs);
         }
     }
 
@@ -964,9 +945,22 @@ bool NavigationStateMachine::HandleWaypointArrival(
             && CanChainSamePointAction(arrived_waypoint, session_->CurrentWaypoint())) {
             const size_t current_node_idx = session_->current_node_idx();
             LogInfo << "TRANSFER chained with same-point follow-up action." << VAR(current_node_idx);
-            SelectPhaseForCurrentWaypoint("transfer_chain_deferred");
+            const Waypoint& chained_waypoint = session_->CurrentWaypoint();
+            const double chained_distance = std::hypot(chained_waypoint.x - real_pos_x, chained_waypoint.y - real_pos_y);
+            const double chained_actual_distance = std::hypot(chained_waypoint.x - position_->x, chained_waypoint.y - position_->y);
+            const double chained_portal_distance =
+                session_->DistanceToAdjacentPortal(session_->current_node_idx(), position_->x, position_->y);
+            const bool chained_portal_commit_ready =
+                chained_waypoint.action == ActionType::PORTAL && chained_actual_distance <= kPortalCommitDistance;
             session_->ResetStraightStableFrames();
-            return true;
+            return HandleWaypointArrival(
+                real_pos_x,
+                real_pos_y,
+                chained_distance,
+                chained_actual_distance,
+                chained_portal_distance,
+                false,
+                chained_portal_commit_ready);
         }
 
         EnterRelocationWait("transfer_wait_started", 0, true, RelocationCompletionPolicy::ResumeRoute);
@@ -1116,6 +1110,9 @@ bool NavigationStateMachine::AttemptRouteRejoin(const char* reason, bool require
 
 bool NavigationStateMachine::HasSevereTurnDrift(double yaw_mismatch, double actual_distance, int64_t stalled_ms) const
 {
+    if (session_->current_node_idx() > 1) {
+        return false;
+    }
     return actual_distance > kAdaptiveActivationMinDistance
            && actual_distance + kAdaptiveActivationDistanceSlack >= session_->best_actual_distance()
            && stalled_ms >= kAdaptiveActivationStallMs && yaw_mismatch >= kAdaptiveActivationSevereYawMismatchDegrees;
